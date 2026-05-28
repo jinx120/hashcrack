@@ -48,6 +48,7 @@ MASK=""
 CMD=""
 KS_CMD=""
 HASHCAT_BIN=$(command -v hashcat 2>/dev/null || echo "hashcat")
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
 # ── Layout ─────────────────────────────────────────────────────────
 INNER_W=56                 # status-box inner content width
@@ -236,8 +237,76 @@ ensure_hashcat() {
     fi
 }
 
+# ── Path discovery ─────────────────────────────────────────────────
+# Candidate roots searched for wordlists / rules. Existing dirs only,
+# deduped at use-time, so wordlists are found wherever they live.
+wordlist_roots() {
+    printf '%s\n' \
+        "$WORDLIST_DIR" \
+        "$HOME/wordlists" "$HOME/Wordlists" "$HOME/wordlist" \
+        "/usr/share/wordlists" "/usr/share/seclists" \
+        "/opt/wordlists" "/opt/seclists" \
+        "$SCRIPT_DIR" "$SCRIPT_DIR/wordlists" "$PWD"
+}
+rules_roots() {
+    printf '%s\n' \
+        "$RULES_DIR" \
+        "$WORDLIST_DIR/rules" "$HOME/wordlists/rules" \
+        "/usr/share/hashcat/rules" "/usr/share/doc/hashcat/rules" \
+        "$SCRIPT_DIR/rules" "$SCRIPT_DIR" "$PWD"
+}
+
+# Read dir paths on stdin → emit existing, canonical, unique dirs
+uniq_existing_dirs() {
+    local seen="" d real
+    while IFS= read -r d; do
+        [[ -z "$d" || ! -d "$d" ]] && continue
+        real="$(cd -- "$d" 2>/dev/null && pwd)" || continue
+        case ":$seen:" in *":$real:"*) continue ;; esac
+        seen+=":$real"; printf '%s\n' "$real"
+    done
+}
+
+# find_one <filename> <roots-fn> → first match across roots, exit 0 if found
+find_one() {
+    local name="$1" rootsfn="$2" d hit
+    while IFS= read -r d; do
+        hit=$(find "$d" -maxdepth 2 -type f -name "$name" 2>/dev/null | head -1)
+        [[ -n "$hit" ]] && { printf '%s' "$hit"; return 0; }
+    done < <("$rootsfn" | uniq_existing_dirs)
+    return 1
+}
+
+# Point WORDLIST_DIR / RULES_DIR at the richest discovered location,
+# but only when the current value is missing or contains nothing usable
+# (so a dir the user set in Settings is never overridden).
+autodetect_dirs() {
+    local d best bestn n
+    if [[ ! -d "$WORDLIST_DIR" ]] || [[ -z "$(find "$WORDLIST_DIR" -maxdepth 2 -type f \
+            \( -name '*.txt' -o -name '*.lst' -o -name '*.dict' \) 2>/dev/null \
+            | grep -vE 'magnet|tracker' | head -1)" ]]; then
+        best=""; bestn=0
+        while IFS= read -r d; do
+            n=$(find "$d" -maxdepth 2 -type f \( -name '*.txt' -o -name '*.lst' -o -name '*.dict' \) \
+                2>/dev/null | grep -vcE 'magnet|tracker')
+            (( n > bestn )) && { bestn=$n; best="$d"; }
+        done < <(wordlist_roots | uniq_existing_dirs)
+        [[ -n "$best" ]] && WORDLIST_DIR="$best"
+    fi
+    if [[ ! -d "$RULES_DIR" ]] || [[ -z "$(find "$RULES_DIR" -maxdepth 2 -type f -name '*.rule' \
+            2>/dev/null | head -1)" ]]; then
+        best=""; bestn=0
+        while IFS= read -r d; do
+            n=$(find "$d" -maxdepth 2 -type f -name '*.rule' 2>/dev/null | wc -l)
+            (( n > bestn )) && { bestn=$n; best="$d"; }
+        done < <(rules_roots | uniq_existing_dirs)
+        [[ -n "$best" ]] && RULES_DIR="$best"
+    fi
+}
+
 # ── Generic file picker ────────────────────────────────────────────
-#  $1 = title  $2 = "extra menu lines"  $3.. = find results captured by caller
+#  $1 = title  $2 = "none" to allow skip  $3.. = candidate file paths
+#  Auto-shows full (~-shortened) paths when files span multiple dirs.
 PICK_RESULT=""
 generic_pick() {
     local title="$1"; shift
@@ -245,11 +314,19 @@ generic_pick() {
     local -a files=("$@")
     PICK_RESULT=""
 
+    local multi=0 d0="" d
+    for f in "${files[@]}"; do
+        d="$(dirname "$f")"
+        [[ -z "$d0" ]] && d0="$d"
+        [[ "$d" != "$d0" ]] && { multi=1; break; }
+    done
+
     local i=1
     for f in "${files[@]}"; do
-        local size
+        local size disp
         if [[ -f "$f" ]]; then size=$(du -sh "$f" 2>/dev/null | cut -f1); else size="?"; fi
-        printf "  ${CYAN}[%2d]${RESET}  %-46s ${DIM}%s${RESET}\n" "$i" "$(basename "$f")" "$size"
+        if (( multi )); then disp="${f/#$HOME/\~}"; else disp="$(basename "$f")"; fi
+        printf "  ${CYAN}[%2d]${RESET}  %-48s ${DIM}%s${RESET}\n" "$i" "$disp" "$size"
         ((i++))
     done
     [[ ${#files[@]} -eq 0 ]] && warn "Nothing found automatically — use manual entry."
@@ -277,10 +354,12 @@ pick_hash_file() {
     section "Select Hash / Capture File"
     info ".hc22000 · .hccapx · .cap · .pcap · .pcapng · hash lists"
     echo ""
+    local roots=(); mapfile -t roots < <(printf '%s\n' \
+        "$PWD" "$SCRIPT_DIR" "$HOME" "$HOME/captures" "$HOME/Desktop" "$WORDLIST_DIR" \
+        | uniq_existing_dirs)
     local files=()
     while IFS= read -r f; do files+=("$f"); done < <(
-        find "$(pwd)" "$HOME" "$HOME/captures" "$HOME/Desktop" "$WORDLIST_DIR" \
-            -maxdepth 2 -type f \
+        find "${roots[@]}" -maxdepth 2 -type f \
             \( -name "*.hc22000" -o -name "*.hccapx" -o -name "*.cap" \
                -o -name "*.pcap" -o -name "*.pcapng" -o -name "*.hash" \) \
             2>/dev/null | sort -u)
@@ -293,13 +372,17 @@ pick_hash_file() {
 pick_wordlist() {
     banner
     section "Select Wordlist"
+    info "Searching: $(wordlist_roots | uniq_existing_dirs | paste -sd' ' | sed "s|$HOME|~|g")"
     echo ""
+    local roots=(); mapfile -t roots < <(wordlist_roots | uniq_existing_dirs)
     local files=()
-    while IFS= read -r f; do
-        [[ "$f" == *magnet* || "$f" == *tracker* ]] && continue
-        files+=("$f")
-    done < <(find "$WORDLIST_DIR" /usr/share/wordlists -maxdepth 1 -type f \
-                  \( -name "*.txt" -o -name "*.lst" -o -name "*.dict" \) 2>/dev/null | sort -V -u)
+    if (( ${#roots[@]} )); then
+        while IFS= read -r f; do
+            [[ "$f" == *magnet* || "$f" == *tracker* ]] && continue
+            files+=("$f")
+        done < <(find "${roots[@]}" -maxdepth 2 -type f \
+                      \( -name "*.txt" -o -name "*.lst" -o -name "*.dict" \) 2>/dev/null | sort -V -u)
+    fi
     generic_pick "wordlist" "no" "${files[@]}" || return 1
     if [[ -f "$PICK_RESULT" ]]; then
         WORDLIST="$PICK_RESULT"; ok "Wordlist: $(basename "$WORDLIST")"; sleep 0.5
@@ -309,11 +392,14 @@ pick_wordlist() {
 pick_rules() {
     banner
     section "Select Rules File  (optional)"
+    info "Searching: $(rules_roots | uniq_existing_dirs | paste -sd' ' | sed "s|$HOME|~|g")"
     echo ""
+    local roots=(); mapfile -t roots < <(rules_roots | uniq_existing_dirs)
     local files=()
-    while IFS= read -r f; do files+=("$f"); done < <(
-        find "$RULES_DIR" "$WORDLIST_DIR" /usr/share/hashcat/rules \
-            -maxdepth 2 -type f -name "*.rule" 2>/dev/null | sort -u)
+    if (( ${#roots[@]} )); then
+        while IFS= read -r f; do files+=("$f"); done < <(
+            find "${roots[@]}" -maxdepth 2 -type f -name "*.rule" 2>/dev/null | sort -u)
+    fi
     generic_pick "rules" "none" "${files[@]}"
     local rc=$?
     [[ $rc -ne 0 ]] && return 1
@@ -453,17 +539,27 @@ run_hashcat() {
 
 # ── Tools ──────────────────────────────────────────────────────────
 convert_capture() {
-    banner
-    section "Convert Capture → hc22000"
-    echo ""
     if ! command -v hcxpcapngtool &>/dev/null; then
+        banner; section "Convert Capture → hc22000"; echo ""
         warn "hcxpcapngtool not installed."
         ask "Install hcxtools now? [Y/n]"; read -r yn
         [[ "$yn" =~ ^[Nn]$ ]] && return
         install_pkgs "$(pkg_for hcxpcapngtool)"
         command -v hcxpcapngtool &>/dev/null || { err "Install failed."; pause; return; }
     fi
-    ask "Path to .cap / .pcapng"; read -r cap; cap="${cap//\"/}"; cap="${cap/#\~/$HOME}"
+    banner
+    section "Convert Capture → hc22000"
+    info "Searching current dir & common capture locations…"
+    echo ""
+    local roots=(); mapfile -t roots < <(printf '%s\n' \
+        "$PWD" "$SCRIPT_DIR" "$HOME" "$HOME/captures" "$HOME/Desktop" \
+        | uniq_existing_dirs)
+    local files=()
+    while IFS= read -r f; do files+=("$f"); done < <(
+        find "${roots[@]}" -maxdepth 2 -type f \
+            \( -name "*.cap" -o -name "*.pcap" -o -name "*.pcapng" \) 2>/dev/null | sort -u)
+    generic_pick "capture" "no" "${files[@]}" || return
+    local cap="$PICK_RESULT"
     [[ ! -f "$cap" ]] && { err "Not found: $cap"; pause; return; }
     local out="${cap%.*}.hc22000"
     echo ""; info "hcxpcapngtool -o $out $cap"; echo ""
@@ -562,11 +658,11 @@ need_hash() { [[ -z "$HASH_FILE" ]] && { pick_hash_file || return 1; }; return 0
 attack_quick() {
     HASH_MODE=22000
     need_hash || return
-    local wl_order=("${WORDLIST_DIR}/kaonashiWPA100M.txt" "${WORDLIST_DIR}/kaonashi14M.txt" "${WORDLIST_DIR}/rockyou.txt" "/usr/share/wordlists/rockyou.txt")
-    local rl_order=("${RULES_DIR}/OneRuleToRuleThemStill.rule" "${RULES_DIR}/OneRuleToRuleThemAll.rule" "/usr/share/hashcat/rules/best64.rule")
-    WORDLIST=""; for f in "${wl_order[@]}"; do [[ -f "$f" ]] && { WORDLIST="$f"; break; }; done
-    RULES_FILE=""; for f in "${rl_order[@]}"; do [[ -f "$f" ]] && { RULES_FILE="$f"; break; }; done
-    [[ -z "$WORDLIST" ]] && { err "No wordlist found in $WORDLIST_DIR"; pause; return; }
+    local wl_pref=(kaonashiWPA100M.txt kaonashi14M.txt rockyou2024.txt rockyou.txt)
+    local rl_pref=(OneRuleToRuleThemStill.rule OneRuleToRuleThemAll.rule best64.rule)
+    WORDLIST="";   for n in "${wl_pref[@]}"; do WORDLIST=$(find_one "$n" wordlist_roots) && break; done
+    RULES_FILE=""; for n in "${rl_pref[@]}"; do RULES_FILE=$(find_one "$n" rules_roots) && break; done
+    [[ -z "$WORDLIST" ]] && { err "No wordlist found in any known location."; pause; return; }
     build_cmd 0 ""
     banner; section "Quick Strike — auto best wordlist + rules"; echo ""
     info "Wordlist : $(basename "$WORDLIST")  ($(du -sh "$WORDLIST" 2>/dev/null | cut -f1))"
@@ -654,5 +750,6 @@ main_menu() {
 trap 'echo; save_config 2>/dev/null; printf "${LCYAN}\nInterrupted — config saved.${RESET}\n"; exit 130' INT
 
 load_config
+autodetect_dirs
 ensure_hashcat
 main_menu
