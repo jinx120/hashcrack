@@ -1,0 +1,29 @@
+# Capture / handshake data — never commit (public repo)
+*.cap
+*.pcap
+*.pcapng
+*.hccapx
+*.hc22000
+*.hash
+*.22000
+
+# Cracked output / hashcat working files
+*.potfile
+hashcat.potfile
+*.restore
+*.log
+*.session
+
+# Wordlists & rules (large / not part of the tool)
+*.txt
+*.lst
+*.dict
+*.rule
+*.7z
+*.gz
+*.zip
+wordlists/
+rules/
+
+# Local config
+.config/
